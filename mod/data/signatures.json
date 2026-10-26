@@ -1,0 +1,6 @@
+{
+  "schemaVersion": 1,
+  "module": "libminecraftpe.so",
+  "note": "Per-build lookup table for Freecam's three hook points. A rule needs cameraPose, moveInput and nameTag (each a byte signature such as '48 8B ?? ?? 89', or an exported symbol name); the first rule whose three entries all resolve is used. No rules are bundled yet, see README.md, section 'Hook signatures'.",
+  "rules": []
+}
