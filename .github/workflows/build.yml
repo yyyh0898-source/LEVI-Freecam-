@@ -1,0 +1,198 @@
+name: Build Freecam
+
+on:
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+env:
+  NDK_VERSION: r28c
+  TARGET_ABI: arm64-v8a
+  TARGET_PLATFORM: android-24
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Native mod: host tests, arm64 build, freecam.levipack
+  # ---------------------------------------------------------------------------
+  mod:
+    name: Native mod (.levipack)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: |
+          command -v ninja >/dev/null || sudo apt-get install -y ninja-build
+          cmake --version
+          ninja --version
+
+      - name: Python tests (packaging script and project files)
+        run: python3 tools/test_package_levipack.py
+
+      - name: Configure host build
+        run: cmake -S mod -B build/host -G Ninja -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build host tools and tests
+        run: cmake --build build/host
+
+      - name: C++ unit tests
+        run: ctest --test-dir build/host --output-on-failure
+
+      - name: Setup Android NDK
+        id: ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: ${{ env.NDK_VERSION }}
+          add-to-path: false
+
+      - name: Configure Android build
+        run: |
+          cmake -S mod -B build/android -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE="${{ steps.ndk.outputs.ndk-path }}/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI="${TARGET_ABI}" \
+            -DANDROID_PLATFORM="${TARGET_PLATFORM}" \
+            -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build libfreecam.so
+        run: cmake --build build/android --target freecam
+
+      - name: Strip debug info
+        run: |
+          LIB="build/android/out/${TARGET_ABI}/libfreecam.so"
+          STRIP="${{ steps.ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip"
+          ls -l "$LIB"
+          "$STRIP" --strip-unneeded "$LIB"
+          ls -l "$LIB"
+
+      - name: Package freecam.levipack
+        shell: bash # explicit bash enables pipefail, so a packaging failure is not hidden by tee
+        run: |
+          VERSION_ARGS=()
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            VERSION_ARGS=(--mod-version "${GITHUB_REF_NAME#v}")
+          fi
+          python3 tools/package_levipack.py \
+            --so "build/android/out/${TARGET_ABI}/libfreecam.so" \
+            --config-gen build/host/freecam_config_gen \
+            --out dist \
+            "${VERSION_ARGS[@]}" | tee package.log
+          {
+            echo '### freecam.levipack'
+            echo '```'
+            cat package.log
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Report hook status
+        run: |
+          RULES=$(python3 -c "import json; print(len(json.load(open('mod/data/signatures.json'))['rules']))")
+          if [ "$RULES" = "0" ] || grep -q "EXTENSION POINT" mod/src/GameBackend.cpp; then
+            MESSAGE="The pack loads and shows its Mod Menu entries, but it cannot detach the camera yet: mod/data/signatures.json has no rules for this Minecraft build and/or the hook detours in mod/src/GameBackend.cpp are not implemented. See README.md, section 'Hook signatures'."
+            echo "::warning title=Camera hooks not available::${MESSAGE}"
+            echo "> **Camera hooks not available.** ${MESSAGE}" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload freecam.levipack
+        uses: actions/upload-artifact@v4
+        with:
+          name: freecam-levipack
+          path: dist/freecam.levipack
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # Android library (AAR): Kotlin tests, release AAR with the pack embedded
+  # ---------------------------------------------------------------------------
+  aar:
+    name: Android library (AAR)
+    needs: mod
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download freecam.levipack
+        uses: actions/download-artifact@v4
+        with:
+          name: freecam-levipack
+          path: aar/freecam-library/src/main/assets
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: platform-tools
+
+      - name: Install SDK packages
+        run: |
+          yes | sdkmanager --licenses
+          sdkmanager "platforms;android-35" "build-tools;34.0.0"
+
+      - name: Kotlin unit tests and release AAR
+        working-directory: aar
+        run: |
+          chmod +x ./gradlew
+          ./gradlew --no-daemon --stacktrace :freecam-library:testDebugUnitTest :freecam-library:assembleRelease
+
+      - name: Check the AAR contents
+        run: |
+          AAR="aar/freecam-library/build/outputs/aar/freecam-library-release.aar"
+          PACK="aar/freecam-library/src/main/assets/freecam.levipack"
+          unzip -l "$AAR"
+          for entry in AndroidManifest.xml classes.jar assets/freecam.levipack; do
+            unzip -l "$AAR" "$entry" > /dev/null || { echo "::error::AAR is missing $entry"; exit 1; }
+          done
+          unzip -p "$AAR" classes.jar > classes.jar
+          unzip -l classes.jar | grep -q "dev/freecam/levi/FreecamConfigStore.class" \
+            || { echo "::error::classes.jar lacks FreecamConfigStore"; exit 1; }
+          unzip -p "$AAR" assets/freecam.levipack | cmp - "$PACK"
+          python3 tools/package_levipack.py --verify "$PACK"
+
+      - name: Upload AAR
+        uses: actions/upload-artifact@v4
+        with:
+          name: freecam-aar
+          path: aar/freecam-library/build/outputs/aar/freecam-library-release.aar
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # Tag builds (v*): attach both files to a GitHub release
+  # ---------------------------------------------------------------------------
+  release:
+    name: GitHub release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [mod, aar]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download build outputs
+        uses: actions/download-artifact@v4
+        with:
+          path: release-files
+          merge-multiple: true
+
+      - name: List files
+        run: ls -l release-files
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release-files/freecam.levipack
+            release-files/freecam-library-release.aar
+          generate_release_notes: true
