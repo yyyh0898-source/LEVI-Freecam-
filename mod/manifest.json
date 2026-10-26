@@ -1,0 +1,10 @@
+{
+  "type": "preload-native",
+  "name": "Freecam",
+  "author": "Freecam for Levi",
+  "version": "1.0.0",
+  "entry": "libfreecam.so",
+  "icon": "icon.png",
+  "minecraft_versions": ["1.26.52", "1.26.52.*"],
+  "overwrite_files": ["icon.png", "data/signatures.json", "config/config.schema.json"]
+}
